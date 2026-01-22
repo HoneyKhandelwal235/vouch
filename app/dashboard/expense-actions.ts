@@ -6,7 +6,22 @@ export async function getExpenses(workspaceId?: string) {
     try {
         let query = supabase
             .from('expenses')
-            .select('*')
+            .select(`
+        *,
+        expense_splits (
+          id,
+          user_id,
+          amount,
+          profiles (
+            email,
+            full_name
+          )
+        ),
+        paid_by_profile:profiles!expenses_paid_by_fkey (
+          email,
+          full_name
+        )
+      `)
             .order('created_at', { ascending: false })
 
         if (workspaceId) {
@@ -27,9 +42,19 @@ export async function getExpenses(workspaceId?: string) {
     }
 }
 
-export async function addExpense(title: string, amount: number, category: string, userId: string, workspaceId?: string) {
+export async function addExpense(
+    title: string,
+    amount: number,
+    category: string,
+    userId: string,
+    workspaceId: string,
+    splitWith: string[], // Array of user IDs to split with
+    splitType: 'equal' | 'unequal' = 'equal',
+    customAmounts?: Record<string, number> // For unequal splits
+) {
     try {
-        const { data, error } = await supabase
+        // Create expense
+        const { data: expense, error: expenseError } = await supabase
             .from('expenses')
             .insert([
                 {
@@ -38,19 +63,51 @@ export async function addExpense(title: string, amount: number, category: string
                     category,
                     user_id: userId,
                     paid_by: userId,
-                    workspace_id: workspaceId || null,
+                    workspace_id: workspaceId,
                     created_at: new Date().toISOString(),
                 }
             ])
             .select()
+            .single()
 
-        if (error) {
-            console.error('Error adding expense:', error)
+        if (expenseError) {
+            console.error('Error adding expense:', expenseError)
             throw new Error('Failed to add expense')
         }
 
+        // Create splits
+        const splits = []
+
+        if (splitType === 'equal') {
+            const splitAmount = amount / splitWith.length
+            for (const splitUserId of splitWith) {
+                splits.push({
+                    expense_id: expense.id,
+                    user_id: splitUserId,
+                    amount: splitAmount,
+                })
+            }
+        } else if (splitType === 'unequal' && customAmounts) {
+            for (const splitUserId of splitWith) {
+                splits.push({
+                    expense_id: expense.id,
+                    user_id: splitUserId,
+                    amount: customAmounts[splitUserId] || 0,
+                })
+            }
+        }
+
+        const { error: splitsError } = await supabase
+            .from('expense_splits')
+            .insert(splits)
+
+        if (splitsError) {
+            console.error('Error creating splits:', splitsError)
+            throw new Error('Failed to create expense splits')
+        }
+
         revalidatePath('/dashboard')
-        return data
+        return expense
     } catch (error) {
         console.error('Error:', error)
         throw error
@@ -59,6 +116,13 @@ export async function addExpense(title: string, amount: number, category: string
 
 export async function deleteExpense(id: string) {
     try {
+        // Delete splits first (foreign key constraint)
+        await supabase
+            .from('expense_splits')
+            .delete()
+            .eq('expense_id', id)
+
+        // Delete expense
         const { error } = await supabase
             .from('expenses')
             .delete()
@@ -70,79 +134,6 @@ export async function deleteExpense(id: string) {
         }
 
         revalidatePath('/dashboard')
-    } catch (error) {
-        console.error('Error:', error)
-        throw error
-    }
-}
-
-// Workspace actions
-export async function getWorkspaces(userId: string) {
-    try {
-        const { data, error } = await supabase
-            .from('workspace_members')
-            .select(`
-        workspace_id,
-        workspaces (
-          id,
-          name,
-          description,
-          color,
-          created_by
-        )
-      `)
-            .eq('user_id', userId)
-
-        if (error) {
-            console.error('Error fetching workspaces:', error)
-            return []
-        }
-
-        return data?.map(item => item.workspaces).filter(Boolean) || []
-    } catch (error) {
-        console.error('Error:', error)
-        return []
-    }
-}
-
-export async function createWorkspace(name: string, userId: string, description?: string, color?: string) {
-    try {
-        const { data: workspace, error: workspaceError } = await supabase
-            .from('workspaces')
-            .insert([
-                {
-                    name,
-                    description,
-                    color: color || '#4F75FF',
-                    created_by: userId,
-                }
-            ])
-            .select()
-            .single()
-
-        if (workspaceError) {
-            console.error('Error creating workspace:', workspaceError)
-            throw new Error('Failed to create workspace')
-        }
-
-        // Add creator as member
-        const { error: memberError } = await supabase
-            .from('workspace_members')
-            .insert([
-                {
-                    workspace_id: workspace.id,
-                    user_id: userId,
-                    role: 'owner',
-                }
-            ])
-
-        if (memberError) {
-            console.error('Error adding member:', memberError)
-            throw new Error('Failed to add workspace member')
-        }
-
-        revalidatePath('/dashboard')
-        return workspace
     } catch (error) {
         console.error('Error:', error)
         throw error
